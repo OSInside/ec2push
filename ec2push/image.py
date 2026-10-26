@@ -1,12 +1,15 @@
 """
 Information about the local disk image file to upload
 """
+import errno
+import lzma
 import math
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import BinaryIO, Iterator, NamedTuple, Optional, Tuple
 
 from ec2push.exceptions import EC2PushImageError
 
@@ -19,15 +22,29 @@ UNSUPPORTED_SUFFIXES = (
 )
 
 
+class ImageBlock(NamedTuple):
+    """
+    A block of the raw disk image
+
+    index is the number of the block, data its content padded with
+    zeros to the block size and position the number of bytes of the
+    image file read so far, the compressed bytes for xz compressed
+    images.
+    """
+    index: int
+    data: bytes
+    position: int
+
+
 @dataclass
 class ImageFile:
     """
     A raw disk image, optionally xz compressed
 
-    upload_size is the number of bytes transferred to the helper
-    instance, raw_size the number of bytes dumped to the target
-    volume. The raw_size of an xz compressed image is None if it
-    can't be determined from the xz index.
+    upload_size is the size of the image file, raw_size the number
+    of bytes written to the root volume of the AMI. The raw_size of
+    an xz compressed image is None if it can't be determined from
+    the xz index.
     """
     path: Path
     upload_size: int
@@ -42,6 +59,60 @@ class ImageFile:
         if self.raw_size is None:
             return None
         return max(1, math.ceil(self.raw_size / GiB))
+
+    def read_blocks(
+        self, block_size: int, max_size: int
+    ) -> Iterator[ImageBlock]:
+        """
+        Read the raw disk image in blocks of the given size
+
+        xz compressed images are decompressed on the fly. Holes of
+        sparse raw images are skipped, they read as zeros anyway.
+        Raises EC2PushImageError if the raw disk image is larger
+        than max_size bytes.
+        """
+        if self.xz_compressed:
+            blocks = self._read_xz_blocks(block_size)
+        else:
+            blocks = self._read_raw_blocks(block_size)
+        for index, data, position in blocks:
+            if index * block_size + len(data) > max_size:
+                raise EC2PushImageError(
+                    f'The raw disk image {self.path} is larger than '
+                    f'{max_size} bytes'
+                )
+            if len(data) < block_size:
+                data += bytes(block_size - len(data))
+            yield ImageBlock(index, data, position)
+
+    def _read_raw_blocks(self, block_size: int) -> Iterator[ImageBlock]:
+        with open(self.path, 'rb') as raw:
+            next_index = 0
+            for start, end in data_ranges(raw, self.upload_size):
+                first = max(start // block_size, next_index)
+                next_index = math.ceil(end / block_size)
+                for index in range(first, next_index):
+                    raw.seek(index * block_size)
+                    data = raw.read(block_size)
+                    if not data:
+                        return
+                    yield ImageBlock(index, data, raw.tell())
+
+    def _read_xz_blocks(self, block_size: int) -> Iterator[ImageBlock]:
+        with open(self.path, 'rb') as compressed:
+            try:
+                with lzma.LZMAFile(compressed) as raw:
+                    index = 0
+                    while True:
+                        data = raw.read(block_size)
+                        if not data:
+                            return
+                        yield ImageBlock(index, data, compressed.tell())
+                        index += 1
+            except (lzma.LZMAError, EOFError) as issue:
+                raise EC2PushImageError(
+                    f'Unable to decompress {self.path}: {issue}'
+                )
 
 
 def read_image_file(path: Path) -> ImageFile:
@@ -71,6 +142,35 @@ def read_image_file(path: Path) -> ImageFile:
         raw_size=upload_size,
         xz_compressed=False
     )
+
+
+def data_ranges(file: BinaryIO, size: int) -> Iterator[Tuple[int, int]]:
+    """
+    Provide the (start, end) offsets of the ranges of the given file
+    which hold data
+
+    Holes of sparse files are skipped. If the platform or filesystem
+    can't tell where the holes are, the whole file is one range.
+    """
+    if not hasattr(os, 'SEEK_DATA'):
+        yield 0, size
+        return
+    descriptor = file.fileno()
+    offset = 0
+    while offset < size:
+        try:
+            start = os.lseek(descriptor, offset, os.SEEK_DATA)
+        except OSError as issue:
+            if issue.errno == errno.ENXIO:
+                # Nothing but a hole up to the end of the file
+                return
+            yield offset, size
+            return
+        end = min(os.lseek(descriptor, start, os.SEEK_HOLE), size)
+        if start >= end:
+            return
+        yield start, end
+        offset = end
 
 
 def read_xz_uncompressed_size(path: Path) -> Optional[int]:

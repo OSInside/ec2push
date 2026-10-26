@@ -1,7 +1,16 @@
 """
 Upload a raw disk image to AWS EC2 and register it as AMI
 
-The procedure follows the one of ec2uploadimg from ec2imgutils:
+There are two upload methods. The direct method writes the image
+with the EBS direct APIs, it needs no EC2 instance:
+
+1. Start a snapshot of the size of the root volume
+2. Write the blocks of the image holding data into the snapshot
+3. Complete the snapshot
+4. Register an AMI from the snapshot
+
+The helper method follows the procedure of ec2uploadimg from
+ec2imgutils:
 
 1. Launch a helper instance and attach two EBS volumes to it, a
    storage volume to receive the image file and the target volume
@@ -13,8 +22,9 @@ The procedure follows the one of ec2uploadimg from ec2imgutils:
 6. Detach the target volume and create a snapshot from it
 7. Register an AMI from the snapshot
 
-All temporary resources (helper instance, volumes, security group
-and key pair) are removed when the procedure ends, also on failure.
+All temporary resources (snapshot, helper instance, volumes,
+security group and key pair) are removed when the procedure ends,
+also on failure.
 """
 import io
 import logging
@@ -34,11 +44,18 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey
 )
 
+from ec2push import ebsdirect
 from ec2push.exceptions import EC2PushAWSError, EC2PushError
 from ec2push.image import GiB, ImageFile
 from ec2push.remote import RemoteHost
 
 log = logging.getLogger('ec2push')
+
+# Upload methods: write the snapshot with the EBS direct APIs or dump
+# the image to a volume attached to a helper instance
+METHOD_DIRECT = 'direct'
+METHOD_HELPER = 'helper'
+UPLOAD_METHODS = (METHOD_DIRECT, METHOD_HELPER)
 
 # Public SSM parameters of the latest Amazon Linux 2023 AMI. These
 # parameters exist in every region and resolve to the AMI id of that
@@ -85,6 +102,8 @@ class UploadConfig:
     Settings of an image upload
     """
     image_name: str
+    method: str = METHOD_DIRECT
+    upload_threads: int = ebsdirect.DEFAULT_THREADS
     description: Optional[str] = None
     arch: str = 'x86_64'
     boot_mode: Optional[str] = None
@@ -123,6 +142,10 @@ class EC2Push:
                 'No AWS region configured, use --region or set the '
                 'region of the profile'
             )
+        if config.method not in UPLOAD_METHODS:
+            raise EC2PushError(f'Unknown upload method {config.method}')
+        if config.upload_threads < 1:
+            raise EC2PushError('At least one upload thread is required')
         if bool(config.ssh_key_name) != bool(config.ssh_private_key):
             raise EC2PushError(
                 'An existing key pair requires both, the key pair name '
@@ -134,6 +157,9 @@ class EC2Push:
         self.region = session.region_name
         self.ec2 = session.client('ec2')
         self.ssm = session.client('ssm')
+        self.ebs = session.client(
+            'ebs', config=ebsdirect.client_config(config.upload_threads)
+        )
 
         self.remote: Optional[RemoteHost] = None
         self.pkey: Optional[paramiko.PKey] = None
@@ -145,7 +171,7 @@ class EC2Push:
         self.instance: Optional[Dict[str, Any]] = None
         self.instance_terminating = False
         self.volumes: List[str] = []
-        # Snapshot of the target volume until an image got registered
+        # Snapshot of the root volume until an image got registered
         # from it
         self.temporary_snapshot: Optional[str] = None
 
@@ -158,38 +184,90 @@ class EC2Push:
         target_size = self._get_target_volume_size(image)
         self._check_image_name_available()
         try:
-            helper_ami = self._resolve_helper_ami()
-            self.subnet_id = self._resolve_subnet()
-            self._setup_key_pair()
-            self._setup_security_group()
-            self._launch_helper_instance(helper_ami)
-            zone = self.instance['Placement']['AvailabilityZone']
-            storage_volume = self._create_volume(
-                math.ceil(image.upload_size / GiB) + STORAGE_OVERHEAD_GIB,
-                zone, 'storage'
-            )
-            target_volume = self._create_volume(target_size, zone, 'target')
-            self._attach_volume(storage_volume, STORAGE_DEVICE)
-            self._attach_volume(target_volume, TARGET_DEVICE)
-            self._connect_helper_instance()
-            storage_device = self._find_volume_device(
-                storage_volume, STORAGE_DEVICE
-            )
-            target_device = self._find_volume_device(
-                target_volume, TARGET_DEVICE
-            )
-            self._create_storage_filesystem(storage_device)
-            remote_image = self._upload_image(image)
-            self._dump_image(image, remote_image, target_device)
-            self._disconnect_helper_instance()
-            self._detach_volume(target_volume)
-            # The helper instance is no longer needed, start its
-            # termination while the snapshot is created
-            self._terminate_helper_instance()
-            snapshot_id = self._create_snapshot(target_volume)
+            if self.config.method == METHOD_DIRECT:
+                snapshot_id = self._write_snapshot(image, target_size)
+            else:
+                snapshot_id = self._dump_with_helper(image, target_size)
             return self._register_image(snapshot_id, target_size)
         finally:
             self.cleanup()
+
+    def _write_snapshot(self, image: ImageFile, volume_size: int) -> str:
+        """
+        Write the image into a new snapshot with the EBS direct APIs
+
+        Returns the id of the completed snapshot
+        """
+        snapshot = self.ebs.start_snapshot(
+            VolumeSize=volume_size,
+            Description=self.config.description or self.config.image_name,
+            Tags=self._image_tag_spec('snapshot')['Tags']
+        )
+        snapshot_id = snapshot['SnapshotId']
+        self.temporary_snapshot = snapshot_id
+        log.info(
+            f'Started snapshot {snapshot_id} of {volume_size}GiB, writing '
+            f'{image.path} with {self.config.upload_threads} threads'
+        )
+
+        def progress(position: int) -> None:
+            if self.upload_progress:
+                self.upload_progress(position, image.upload_size)
+        blocks = ebsdirect.write_snapshot_blocks(
+            self.ebs, snapshot_id,
+            image.read_blocks(ebsdirect.BLOCK_SIZE, volume_size * GiB),
+            self.config.upload_threads, progress
+        )
+        progress(image.upload_size)
+        log.info(
+            f'Wrote {blocks} blocks of '
+            f'{blocks * ebsdirect.BLOCK_SIZE / GiB:.2f}GiB data'
+        )
+        self.ebs.complete_snapshot(
+            SnapshotId=snapshot_id, ChangedBlocksCount=blocks
+        )
+        log.info(f'Completing snapshot {snapshot_id}, waiting for it')
+        self._wait(
+            'snapshot_completed', WAIT_SNAPSHOT, SnapshotIds=[snapshot_id]
+        )
+        return snapshot_id
+
+    def _dump_with_helper(self, image: ImageFile, volume_size: int) -> str:
+        """
+        Dump the image to a volume attached to a helper instance and
+        create a snapshot of the volume
+
+        Returns the id of the completed snapshot
+        """
+        helper_ami = self._resolve_helper_ami()
+        self.subnet_id = self._resolve_subnet()
+        self._setup_key_pair()
+        self._setup_security_group()
+        self._launch_helper_instance(helper_ami)
+        zone = self.instance['Placement']['AvailabilityZone']
+        storage_volume = self._create_volume(
+            math.ceil(image.upload_size / GiB) + STORAGE_OVERHEAD_GIB,
+            zone, 'storage'
+        )
+        target_volume = self._create_volume(volume_size, zone, 'target')
+        self._attach_volume(storage_volume, STORAGE_DEVICE)
+        self._attach_volume(target_volume, TARGET_DEVICE)
+        self._connect_helper_instance()
+        storage_device = self._find_volume_device(
+            storage_volume, STORAGE_DEVICE
+        )
+        target_device = self._find_volume_device(
+            target_volume, TARGET_DEVICE
+        )
+        self._create_storage_filesystem(storage_device)
+        remote_image = self._upload_image(image)
+        self._dump_image(image, remote_image, target_device)
+        self._disconnect_helper_instance()
+        self._detach_volume(target_volume)
+        # The helper instance is no longer needed, start its
+        # termination while the snapshot is created
+        self._terminate_helper_instance()
+        return self._create_snapshot(target_volume)
 
     def cleanup(self) -> None:
         """

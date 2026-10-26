@@ -1,12 +1,22 @@
+import base64
+import hashlib
+import lzma
+
 import pytest
 from botocore.exceptions import ClientError
 
-from ec2push.exceptions import EC2PushAWSError, EC2PushError
+import ec2push.uploader as uploader
+from ec2push.ebsdirect import BLOCK_SIZE
+from ec2push.exceptions import EC2PushAWSError, EC2PushError, EC2PushImageError
 from ec2push.image import read_image_file
 from ec2push.uploader import (
-    HELPER_AMI_PARAMETERS, MOUNT_POINT, ROOT_DEVICE, EC2Push, UploadConfig,
-    load_private_key
+    HELPER_AMI_PARAMETERS, METHOD_HELPER, MOUNT_POINT, ROOT_DEVICE,
+    UPLOAD_METHODS, EC2Push, UploadConfig, load_private_key
 )
+
+
+def helper_config(**arguments):
+    return UploadConfig(method=METHOD_HELPER, **arguments)
 
 
 def spy_register_image(pusher):
@@ -62,7 +72,7 @@ def leftovers(session):
 
 
 def test_push(aws, remote, raw_image):
-    config = UploadConfig(
+    config = helper_config(
         image_name='test-image',
         description='Test image',
         boot_mode='uefi',
@@ -132,7 +142,7 @@ def test_push(aws, remote, raw_image):
 def test_push_cleanup_on_failure(aws, remote, raw_image):
     remote.fail_on = 'dd '
     with pytest.raises(EC2PushError, match='failed'):
-        EC2Push(aws, UploadConfig(image_name='test-image')).push(
+        EC2Push(aws, helper_config(image_name='test-image')).push(
             read_image_file(raw_image)
         )
     images = aws.client('ec2').describe_images(Owners=['self'])['Images']
@@ -140,33 +150,34 @@ def test_push_cleanup_on_failure(aws, remote, raw_image):
     assert leftovers(aws) == []
 
 
-def test_push_existing_image_name(aws, remote, raw_image):
-    EC2Push(aws, UploadConfig(image_name='test-image')).push(
-        read_image_file(raw_image)
-    )
+@pytest.mark.parametrize('method', UPLOAD_METHODS)
+def test_push_existing_image_name(aws, remote, raw_image, method):
+    config = UploadConfig(image_name='test-image', method=method)
+    EC2Push(aws, config).push(read_image_file(raw_image))
     remote.instances = []
     with pytest.raises(EC2PushError, match='already exists'):
-        EC2Push(aws, UploadConfig(image_name='test-image')).push(
-            read_image_file(raw_image)
-        )
-    # Nothing was launched for the second upload
+        EC2Push(aws, config).push(read_image_file(raw_image))
+    # Nothing was launched or started for the second upload
     assert remote.instances == []
+    assert len(image_snapshots(aws)) == 1
 
 
-def test_push_root_volume_too_small(aws, remote, raw_image):
-    config = UploadConfig(image_name='test-image', root_volume_size=2)
+@pytest.mark.parametrize('method', UPLOAD_METHODS)
+def test_push_root_volume_too_small(aws, remote, raw_image, method):
+    config = UploadConfig(
+        image_name='test-image', root_volume_size=2, method=method
+    )
     with pytest.raises(EC2PushError, match='too small'):
         EC2Push(aws, config).push(read_image_file(raw_image))
 
 
 def test_push_xz_image(aws, remote, tmp_path):
-    import lzma
     path = tmp_path / 'image.raw.xz'
     with lzma.open(path, 'wb') as xz:
         xz.write(b'\0' * 4096)
     image = read_image_file(path)
     image.raw_size = None
-    config = UploadConfig(image_name='test-image', root_volume_size=10)
+    config = helper_config(image_name='test-image', root_volume_size=10)
     pusher = EC2Push(aws, config)
     register_calls = spy_register_image(pusher)
     pusher.push(image)
@@ -178,13 +189,15 @@ def test_push_xz_image(aws, remote, tmp_path):
     )
 
 
-def test_push_xz_image_unknown_size(aws, remote, tmp_path):
+@pytest.mark.parametrize('method', UPLOAD_METHODS)
+def test_push_xz_image_unknown_size(aws, remote, tmp_path, method):
     path = tmp_path / 'image.raw.xz'
     path.write_bytes(b'not really xz')
     image = read_image_file(path)
     image.raw_size = None
+    config = UploadConfig(image_name='test-image', method=method)
     with pytest.raises(EC2PushError, match='--root-volume-size'):
-        EC2Push(aws, UploadConfig(image_name='test-image')).push(image)
+        EC2Push(aws, config).push(image)
 
 
 def test_push_with_existing_key_and_group(aws, remote, raw_image, tmp_path):
@@ -211,7 +224,7 @@ def test_push_with_existing_key_and_group(aws, remote, raw_image, tmp_path):
     group_id = ec2.create_security_group(
         GroupName='my-group', Description='ssh', VpcId=vpc_id
     )['GroupId']
-    config = UploadConfig(
+    config = helper_config(
         image_name='test-image',
         ssh_key_name='my-key',
         ssh_private_key=key_file,
@@ -226,7 +239,7 @@ def test_push_with_existing_key_and_group(aws, remote, raw_image, tmp_path):
 
 def test_key_pair_name_requires_private_key(aws):
     with pytest.raises(EC2PushError, match='both'):
-        EC2Push(aws, UploadConfig(image_name='x', ssh_key_name='my-key'))
+        EC2Push(aws, helper_config(image_name='x', ssh_key_name='my-key'))
 
 
 def test_missing_region(aws, monkeypatch):
@@ -234,11 +247,11 @@ def test_missing_region(aws, monkeypatch):
     monkeypatch.delenv('AWS_DEFAULT_REGION')
     session = boto3.session.Session()
     with pytest.raises(EC2PushError, match='region'):
-        EC2Push(session, UploadConfig(image_name='x'))
+        EC2Push(session, helper_config(image_name='x'))
 
 
 def test_helper_ami_default_x86_64(aws):
-    pusher = EC2Push(aws, UploadConfig(image_name='x'))
+    pusher = EC2Push(aws, helper_config(image_name='x'))
     expected = aws.client('ssm').get_parameter(
         Name=HELPER_AMI_PARAMETERS['x86_64']
     )['Parameter']['Value']
@@ -246,7 +259,7 @@ def test_helper_ami_default_x86_64(aws):
 
 
 def test_helper_ami_default_follows_instance_type(aws):
-    config = UploadConfig(image_name='x', instance_type='t4g.micro')
+    config = helper_config(image_name='x', instance_type='t4g.micro')
     expected = aws.client('ssm').get_parameter(
         Name=HELPER_AMI_PARAMETERS['arm64']
     )['Parameter']['Value']
@@ -254,7 +267,7 @@ def test_helper_ami_default_follows_instance_type(aws):
 
 
 def test_helper_ami_id(aws):
-    config = UploadConfig(image_name='x', helper_ami='ami-0123456789abcdef0')
+    config = helper_config(image_name='x', helper_ami='ami-0123456789abcdef0')
     assert EC2Push(aws, config)._resolve_helper_ami() == (
         'ami-0123456789abcdef0'
     )
@@ -265,20 +278,20 @@ def test_helper_ami_ssm_parameter(aws):
         Name='/custom/helper', Value='ami-0aaaaaaaaaaaaaaaa', Type='String'
     )
     for helper_ami in ('/custom/helper', 'resolve:ssm:/custom/helper'):
-        config = UploadConfig(image_name='x', helper_ami=helper_ami)
+        config = helper_config(image_name='x', helper_ami=helper_ami)
         assert EC2Push(aws, config)._resolve_helper_ami() == (
             'ami-0aaaaaaaaaaaaaaaa'
         )
 
 
 def test_helper_ami_ssm_parameter_missing(aws):
-    config = UploadConfig(image_name='x', helper_ami='/missing')
+    config = helper_config(image_name='x', helper_ami='/missing')
     with pytest.raises(EC2PushError, match='Unable to resolve'):
         EC2Push(aws, config)._resolve_helper_ami()
 
 
 def test_subnet_default(aws):
-    subnet_id = EC2Push(aws, UploadConfig(image_name='x'))._resolve_subnet()
+    subnet_id = EC2Push(aws, helper_config(image_name='x'))._resolve_subnet()
     subnet = aws.client('ec2').describe_subnets(
         SubnetIds=[subnet_id]
     )['Subnets'][0]
@@ -296,11 +309,11 @@ def test_subnet_without_default_vpc(aws):
         ec2.delete_subnet(SubnetId=subnet['SubnetId'])
     ec2.delete_vpc(VpcId=vpc_id)
     with pytest.raises(EC2PushError, match='No default VPC'):
-        EC2Push(aws, UploadConfig(image_name='x'))._resolve_subnet()
+        EC2Push(aws, helper_config(image_name='x'))._resolve_subnet()
 
 
 def test_subnet_instance_type_not_offered(aws, monkeypatch):
-    pusher = EC2Push(aws, UploadConfig(image_name='x'))
+    pusher = EC2Push(aws, helper_config(image_name='x'))
     monkeypatch.setattr(
         pusher.ec2, 'describe_instance_type_offerings',
         lambda **arguments: {'InstanceTypeOfferings': []}
@@ -315,7 +328,7 @@ def test_push_in_subnet_with_private_ip(aws, remote, raw_image):
     subnet_id = ec2.create_subnet(
         VpcId=vpc_id, CidrBlock='10.0.1.0/24'
     )['Subnet']['SubnetId']
-    config = UploadConfig(
+    config = helper_config(
         image_name='test-image', subnet_id=subnet_id, use_private_ip=True
     )
     pusher = EC2Push(aws, config)
@@ -344,7 +357,7 @@ def test_find_volume_device_retry(aws, remote, raw_image, monkeypatch):
             raise EC2PushError('not yet')
         return find_volume_device(self, volume_id, device_name)
     monkeypatch.setattr(remote, 'find_volume_device', appears_late)
-    EC2Push(aws, UploadConfig(image_name='test-image')).push(
+    EC2Push(aws, helper_config(image_name='test-image')).push(
         read_image_file(raw_image)
     )
     assert lookups == ['/dev/sdf'] * 3 + ['/dev/sdg'] * 3
@@ -355,14 +368,14 @@ def test_find_volume_device_gives_up(aws, remote, raw_image, monkeypatch):
         raise EC2PushError('no device')
     monkeypatch.setattr(remote, 'find_volume_device', never)
     with pytest.raises(EC2PushError, match='no device'):
-        EC2Push(aws, UploadConfig(image_name='test-image')).push(
+        EC2Push(aws, helper_config(image_name='test-image')).push(
             read_image_file(raw_image)
         )
     assert leftovers(aws) == []
 
 
 def test_cleanup_security_group_retry(aws, remote, raw_image):
-    pusher = EC2Push(aws, UploadConfig(image_name='test-image'))
+    pusher = EC2Push(aws, helper_config(image_name='test-image'))
     delete_security_group = pusher.ec2.delete_security_group
     attempts = []
 
@@ -381,7 +394,7 @@ def test_cleanup_security_group_retry(aws, remote, raw_image):
 
 
 def test_cleanup_continues_after_failure(aws, remote, raw_image, caplog):
-    pusher = EC2Push(aws, UploadConfig(image_name='test-image'))
+    pusher = EC2Push(aws, helper_config(image_name='test-image'))
 
     def volume_in_use(**arguments):
         raise ClientError(
@@ -402,7 +415,7 @@ def test_cleanup_continues_after_failure(aws, remote, raw_image, caplog):
 
 
 def test_wait_failure(aws, remote):
-    pusher = EC2Push(aws, UploadConfig(image_name='x'))
+    pusher = EC2Push(aws, helper_config(image_name='x'))
     volume_id = pusher.ec2.create_volume(
         AvailabilityZone=f'{aws.region_name}a', Size=1
     )['VolumeId']
@@ -417,8 +430,12 @@ def test_load_private_key_invalid(tmp_path):
         load_private_key(key_file)
 
 
-def test_snapshot_removed_if_registration_fails(aws, remote, raw_image):
-    pusher = EC2Push(aws, UploadConfig(image_name='test-image'))
+@pytest.mark.parametrize('method', UPLOAD_METHODS)
+def test_snapshot_removed_if_registration_fails(
+    aws, remote, raw_image, method
+):
+    config = UploadConfig(image_name='test-image', method=method)
+    pusher = EC2Push(aws, config)
 
     def register_fails(**arguments):
         raise ClientError(
@@ -432,8 +449,10 @@ def test_snapshot_removed_if_registration_fails(aws, remote, raw_image):
     assert leftovers(aws) == []
 
 
-def test_image_not_available(aws, remote, raw_image, monkeypatch):
-    pusher = EC2Push(aws, UploadConfig(image_name='test-image'))
+@pytest.mark.parametrize('method', UPLOAD_METHODS)
+def test_image_not_available(aws, remote, raw_image, monkeypatch, method):
+    config = UploadConfig(image_name='test-image', method=method)
+    pusher = EC2Push(aws, config)
     wait = pusher._wait
 
     def image_never_available(name, config=None, **arguments):
@@ -445,3 +464,167 @@ def test_image_not_available(aws, remote, raw_image, monkeypatch):
         pusher.push(read_image_file(raw_image))
     # The snapshot belongs to the registered image and is kept
     assert len(image_snapshots(aws)) == 1
+
+
+def snapshot_blocks(session, snapshot_id):
+    """
+    Read the written blocks of the given snapshot with the EBS direct
+    APIs, verifies the checksum of each block
+    """
+    ebs = session.client('ebs')
+    blocks = {}
+    for block in ebs.list_snapshot_blocks(SnapshotId=snapshot_id)['Blocks']:
+        index = int(block['BlockIndex'])
+        response = ebs.get_snapshot_block(
+            SnapshotId=snapshot_id, BlockIndex=index,
+            BlockToken=block['BlockToken']
+        )
+        data = response['BlockData'].read()
+        assert response['Checksum'] == base64.b64encode(
+            hashlib.sha256(data).digest()
+        ).decode()
+        blocks[index] = data
+    return blocks
+
+
+def write_sample_image(path):
+    """
+    Write a raw image of 6.x blocks: data in the first block, an
+    explicitly written zero block, a hole and some data in the last,
+    partial block. Returns the expected content of the snapshot.
+    """
+    with open(path, 'wb') as raw:
+        raw.write(b'\x01' * 1000)
+        raw.seek(BLOCK_SIZE)
+        raw.write(bytes(BLOCK_SIZE))
+        raw.seek(6 * BLOCK_SIZE + 10)
+        raw.write(b'end')
+        raw.truncate(6 * BLOCK_SIZE + 100)
+    return {
+        0: b'\x01' * 1000 + bytes(BLOCK_SIZE - 1000),
+        6: bytes(10) + b'end' + bytes(BLOCK_SIZE - 13),
+    }
+
+
+def spy_complete_snapshot(pusher):
+    calls = []
+    complete_snapshot = pusher.ebs.complete_snapshot
+
+    def spy(**arguments):
+        calls.append(arguments)
+        return complete_snapshot(**arguments)
+    pusher.ebs.complete_snapshot = spy
+    return calls
+
+
+def test_push_direct(aws, remote, tmp_path):
+    path = tmp_path / 'image.raw'
+    expected_blocks = write_sample_image(path)
+    config = UploadConfig(
+        image_name='test-image', description='Test image',
+        tags={'project': 'demo'}, upload_threads=2
+    )
+    progress = []
+    pusher = EC2Push(
+        aws, config, lambda done, total: progress.append((done, total))
+    )
+    register_calls = spy_register_image(pusher)
+    complete_calls = spy_complete_snapshot(pusher)
+    image_id = pusher.push(read_image_file(path))
+
+    ec2 = aws.client('ec2')
+    assert ec2.describe_images(ImageIds=[image_id])['Images']
+    mapping = register_calls[0]['BlockDeviceMappings'][0]
+    assert mapping['Ebs']['VolumeSize'] == 1
+    snapshot_id = mapping['Ebs']['SnapshotId']
+    snapshot = ec2.describe_snapshots(
+        SnapshotIds=[snapshot_id]
+    )['Snapshots'][0]
+    assert snapshot['Description'] == 'Test image'
+    assert {'Key': 'project', 'Value': 'demo'} in snapshot['Tags']
+    assert {'Key': 'Name', 'Value': 'test-image'} in snapshot['Tags']
+    # Zero blocks and holes are not written
+    assert snapshot_blocks(aws, snapshot_id) == expected_blocks
+    assert complete_calls == [
+        {'SnapshotId': snapshot_id, 'ChangedBlocksCount': 2}
+    ]
+    size = path.stat().st_size
+    assert progress[-1] == (size, size)
+    assert progress == sorted(progress)
+    # No helper instance or other temporary resources
+    assert remote.instances == []
+    assert leftovers(aws) == []
+
+
+def test_push_direct_xz_image(aws, remote, tmp_path):
+    raw = tmp_path / 'image.raw'
+    expected_blocks = write_sample_image(raw)
+    path = tmp_path / 'image.raw.xz'
+    with lzma.open(path, 'wb') as xz:
+        xz.write(raw.read_bytes())
+    image = read_image_file(path)
+    image.raw_size = None
+    config = UploadConfig(image_name='test-image', root_volume_size=2)
+    pusher = EC2Push(aws, config)
+    register_calls = spy_register_image(pusher)
+    pusher.push(image)
+    mapping = register_calls[0]['BlockDeviceMappings'][0]
+    assert mapping['Ebs']['VolumeSize'] == 2
+    snapshot_id = mapping['Ebs']['SnapshotId']
+    assert snapshot_blocks(aws, snapshot_id) == expected_blocks
+    assert leftovers(aws) == []
+
+
+def test_push_direct_block_failure(aws, remote, tmp_path):
+    path = tmp_path / 'image.raw'
+    write_sample_image(path)
+    pusher = EC2Push(aws, UploadConfig(image_name='test-image'))
+
+    def put_fails(**arguments):
+        raise ClientError(
+            {'Error': {'Code': 'ValidationException', 'Message': 'bad'}},
+            'PutSnapshotBlock'
+        )
+    pusher.ebs.put_snapshot_block = put_fails
+    with pytest.raises(ClientError, match='bad'):
+        pusher.push(read_image_file(path))
+    assert image_snapshots(aws) == []
+    assert aws.client('ec2').describe_images(Owners=['self'])['Images'] == []
+
+
+def test_push_direct_interrupted(aws, remote, tmp_path):
+    path = tmp_path / 'image.raw'
+    write_sample_image(path)
+
+    def interrupt(done, total):
+        raise KeyboardInterrupt()
+    pusher = EC2Push(aws, UploadConfig(image_name='test-image'), interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        pusher.push(read_image_file(path))
+    assert image_snapshots(aws) == []
+
+
+def test_push_direct_image_larger_than_volume(
+    aws, remote, tmp_path, monkeypatch
+):
+    # Volume sizes are given in MiB instead of GiB to keep the test
+    # image small
+    monkeypatch.setattr(uploader, 'GiB', 1024 ** 2)
+    path = tmp_path / 'image.raw.xz'
+    with lzma.open(path, 'wb') as xz:
+        xz.write(bytes(3 * 1024 ** 2 - 1) + b'\x01')
+    image = read_image_file(path)
+    image.raw_size = None
+    config = UploadConfig(image_name='test-image', root_volume_size=2)
+    with pytest.raises(EC2PushImageError, match='larger than'):
+        EC2Push(aws, config).push(image)
+    assert image_snapshots(aws) == []
+
+
+@pytest.mark.parametrize('arguments, message', [
+    ({'method': 'other'}, 'Unknown upload method'),
+    ({'upload_threads': 0}, 'upload thread'),
+])
+def test_invalid_config(aws, arguments, message):
+    with pytest.raises(EC2PushError, match=message):
+        EC2Push(aws, UploadConfig(image_name='x', **arguments))

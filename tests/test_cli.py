@@ -53,9 +53,34 @@ def test_push(pusher, raw_image):
     assert not config.sriov_support
     assert config.ena_support
     assert config.tags == {'project': 'demo', 'empty': ''}
+    assert config.method == 'direct'
+    assert config.upload_threads == 16
     assert config.helper_ami == DEFAULT_HELPER_AMI
     assert config.instance_type == 't2.micro'
     assert config.ssh_user == 'ec2-user'
+
+
+def test_push_with_helper(pusher, raw_image):
+    result = runner.invoke(cli.app, [
+        str(raw_image), '--name', 'test-image', '--method', 'helper',
+        '--instance-type', 't3.micro', '--upload-threads', '4',
+    ])
+    assert result.exit_code == 0, result.output
+    config = pusher.calls[0][1]
+    assert config.method == 'helper'
+    assert config.instance_type == 't3.micro'
+    assert config.upload_threads == 4
+
+
+@pytest.mark.parametrize('arguments', [
+    ['--method', 'other'], ['--upload-threads', '0'],
+])
+def test_invalid_upload_options(pusher, raw_image, arguments):
+    result = runner.invoke(
+        cli.app, [str(raw_image), '--name', 'x'] + arguments
+    )
+    assert result.exit_code == 2
+    assert pusher.calls == []
 
 
 def test_push_failure(pusher, raw_image):

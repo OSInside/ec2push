@@ -8,9 +8,11 @@ ec2push IMAGE_FILE --name NAME [OPTIONS]
   registered AMI is printed to stdout, all other messages are
   printed to stderr.
 
-  The image is uploaded through a helper instance which is
-  launched from a public Amazon Linux 2023 AMI by default. The AMI
-  is resolved from a public SSM parameter which exists in every
+  By default the image is written into a new EBS snapshot with the
+  EBS direct APIs, no EC2 instance is involved. With --method helper
+  the image is uploaded through a helper instance which is launched
+  from a public Amazon Linux 2023 AMI by default. The AMI is
+  resolved from a public SSM parameter which exists in every
   region. The AWS credentials are taken from the given profile as
   configured in ~/.aws/config, without a profile the default
   credentials of boto3 are used.
@@ -31,11 +33,12 @@ from rich.progress import (
 )
 
 from ec2push import __version__
+from ec2push.ebsdirect import DEFAULT_THREADS
 from ec2push.exceptions import EC2PushError
 from ec2push.image import read_image_file
 from ec2push.uploader import (
-    DEFAULT_HELPER_AMI, DEFAULT_INSTANCE_TYPE, DEFAULT_SSH_USER, EC2Push,
-    UploadConfig
+    DEFAULT_HELPER_AMI, DEFAULT_INSTANCE_TYPE, DEFAULT_SSH_USER,
+    METHOD_DIRECT, METHOD_HELPER, EC2Push, UploadConfig
 )
 
 log = logging.getLogger('ec2push')
@@ -46,6 +49,14 @@ app = typer.Typer(
     add_completion=False,
     no_args_is_help=True
 )
+
+# Help section of the options which only apply to --method helper
+HELPER_PANEL = 'Helper instance options (--method helper)'
+
+
+class UploadMethod(str, Enum):
+    direct = METHOD_DIRECT
+    helper = METHOD_HELPER
 
 
 class Architecture(str, Enum):
@@ -140,47 +151,66 @@ def main(
         [], '--tag', '-t', metavar='KEY=VALUE',
         help='Tag of the AMI and its snapshot, can be repeated'
     ),
+    method: UploadMethod = typer.Option(
+        UploadMethod.direct, '--method',
+        help='Write the snapshot with the EBS direct APIs or through a '
+             'helper instance'
+    ),
+    upload_threads: int = typer.Option(
+        DEFAULT_THREADS, '--upload-threads', min=1, max=64,
+        help='Parallel block uploads of the direct method'
+    ),
     helper_ami: str = typer.Option(
         DEFAULT_HELPER_AMI, '--helper-ami',
-        help='AMI id or SSM parameter name of the helper instance AMI'
+        help='AMI id or SSM parameter name of the helper instance AMI',
+        rich_help_panel=HELPER_PANEL
     ),
     instance_type: str = typer.Option(
         DEFAULT_INSTANCE_TYPE, '--instance-type',
-        help='Instance type of the helper instance'
+        help='Instance type of the helper instance',
+        rich_help_panel=HELPER_PANEL
     ),
     ssh_user: str = typer.Option(
         DEFAULT_SSH_USER, '--ssh-user',
-        help='Login user of the helper instance'
+        help='Login user of the helper instance',
+        rich_help_panel=HELPER_PANEL
     ),
     ssh_key_name: Optional[str] = typer.Option(
         None, '--ssh-key-name',
-        help='Existing EC2 key pair, a temporary one is created by default'
+        help='Existing EC2 key pair, a temporary one is created by default',
+        rich_help_panel=HELPER_PANEL
     ),
     ssh_private_key: Optional[Path] = typer.Option(
         None, '--ssh-private-key', exists=True, dir_okay=False,
-        help='Private key file of --ssh-key-name'
+        help='Private key file of --ssh-key-name',
+        rich_help_panel=HELPER_PANEL
     ),
     ssh_timeout: int = typer.Option(
         300, '--ssh-timeout', min=1,
-        help='Seconds to wait for ssh access to the helper instance'
+        help='Seconds to wait for ssh access to the helper instance',
+        rich_help_panel=HELPER_PANEL
     ),
     ssh_cidr: str = typer.Option(
         '0.0.0.0/0', '--ssh-cidr',
         help='Source address range of ssh access in the temporary '
-             'security group'
+             'security group',
+        rich_help_panel=HELPER_PANEL
     ),
     subnet_id: Optional[str] = typer.Option(
         None, '--subnet-id',
-        help='Subnet of the helper instance, defaults to a default subnet'
+        help='Subnet of the helper instance, defaults to a default subnet',
+        rich_help_panel=HELPER_PANEL
     ),
     security_group_id: Optional[str] = typer.Option(
         None, '--security-group-id',
         help='Security group of the helper instance allowing ssh access, '
-             'a temporary one is created by default'
+             'a temporary one is created by default',
+        rich_help_panel=HELPER_PANEL
     ),
     private_ip: bool = typer.Option(
         False, '--private-ip',
-        help='Connect to the private IP address of the helper instance'
+        help='Connect to the private IP address of the helper instance',
+        rich_help_panel=HELPER_PANEL
     ),
     verbose: bool = typer.Option(
         False, '--verbose', '-v', help='Show debug messages'
@@ -209,6 +239,8 @@ def main(
 
     config = UploadConfig(
         image_name=name,
+        method=method.value,
+        upload_threads=upload_threads,
         description=description,
         arch=arch.value,
         boot_mode=boot_mode.value if boot_mode else None,
