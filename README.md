@@ -124,7 +124,7 @@ AMI needs `bash`, `sudo`, `lsblk`, `mkfs.ext4`, `dd`, `head`,
 
     poetry install
 
-## Usage
+## Usage From Source
 
     poetry run ec2push IMAGE_FILE --name NAME [OPTIONS]
 
@@ -163,6 +163,30 @@ use `--root-volume-size`. The direct method decompresses xz images
 with the Python lzma module and doesn't need the `xz` tool otherwise.
 
 Run `poetry run ec2push --help` for all options.
+
+## Usage From a Container
+
+ec2push is provided as an OCI container at
+`public.ecr.aws/b9k1j9y6/cloudsdk/ec2push`. As such running an upload
+container based can be done like the following example shows:
+
+    IMAGE=/path/to/some/image.raw.xz
+    NAME=some-name
+    AWS_PROFILE=aws-profile-name
+    REGION=us-east-1
+
+    podman run --rm -it \
+      -v $HOME/.aws:/root/.aws \
+      -v $IMAGE:/image.raw.xz:Z \
+    public.ecr.aws/b9k1j9y6/cloudsdk/ec2push:latest \
+      --name $NAME \
+      --profile $AWS_PROFILE \
+      --region $REGION \
+      --boot-mode uefi-preferred \
+      --arch x86_64 \
+      --ena \
+      --sriov \
+      /image.raw.xz
 
 ## Development
 
