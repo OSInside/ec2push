@@ -55,6 +55,7 @@ def test_push(pusher, raw_image):
     assert config.tags == {'project': 'demo', 'empty': ''}
     assert config.method == 'direct'
     assert config.upload_threads == 16
+    assert config.verify
     assert config.helper_ami == DEFAULT_HELPER_AMI
     assert config.instance_type == 't2.micro'
     assert config.ssh_user == 'ec2-user'
@@ -117,3 +118,11 @@ def test_version():
     result = runner.invoke(cli.app, ['--version'])
     assert result.exit_code == 0
     assert result.stdout == f'ec2push {__version__}\n'
+
+
+def test_push_without_verify(pusher, raw_image):
+    result = runner.invoke(
+        cli.app, [str(raw_image), '--name', 'x', '--no-verify']
+    )
+    assert result.exit_code == 0, result.output
+    assert not pusher.calls[0][1].verify

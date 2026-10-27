@@ -2,11 +2,14 @@
 Information about the local disk image file to upload
 """
 import errno
+import hashlib
 import lzma
 import math
 import os
 import shutil
 import subprocess
+import threading
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Iterator, NamedTuple, Optional, Tuple
@@ -14,6 +17,8 @@ from typing import BinaryIO, Iterator, NamedTuple, Optional, Tuple
 from ec2push.exceptions import EC2PushImageError
 
 GiB = 1024 ** 3
+# Bytes read at once to compute the checksum of the raw disk image
+CHECKSUM_CHUNK_SIZE = 4 * 1024 ** 2
 
 # Formats which look like a disk image but can't be dumped as is
 UNSUPPORTED_SUFFIXES = (
@@ -113,6 +118,41 @@ class ImageFile:
                 raise EC2PushImageError(
                     f'Unable to decompress {self.path}: {issue}'
                 )
+
+    def raw_checksum(
+        self, cancel: Optional[threading.Event] = None
+    ) -> Tuple[str, int]:
+        """
+        Compute the SHA256 checksum of the raw disk image
+
+        xz compressed images are decompressed on the fly. Returns the
+        hex digest and the size of the raw disk image. Raises
+        EC2PushImageError if the given cancel event gets set.
+        """
+        checksum = hashlib.sha256()
+        size = 0
+        with open(self.path, 'rb') as file:
+            try:
+                with (
+                    lzma.LZMAFile(file) if self.xz_compressed
+                    else nullcontext(file)
+                ) as raw:
+                    while True:
+                        if cancel and cancel.is_set():
+                            raise EC2PushImageError(
+                                f'Checksum computation of {self.path} '
+                                'cancelled'
+                            )
+                        data = raw.read(CHECKSUM_CHUNK_SIZE)
+                        if not data:
+                            break
+                        checksum.update(data)
+                        size += len(data)
+            except (lzma.LZMAError, EOFError) as issue:
+                raise EC2PushImageError(
+                    f'Unable to decompress {self.path}: {issue}'
+                )
+        return checksum.hexdigest(), size
 
 
 def read_image_file(path: Path) -> ImageFile:

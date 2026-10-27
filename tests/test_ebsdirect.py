@@ -9,6 +9,7 @@ from ec2push.ebsdirect import (
     BLOCK_SIZE, BLOCKS_PER_THREAD, MAX_ATTEMPTS, client_config,
     write_snapshot_blocks
 )
+from ec2push.exceptions import EC2PushError
 from ec2push.image import ImageBlock
 
 SNAPSHOT_ID = 'snap-0123456789abcdef0'
@@ -43,6 +44,17 @@ class FakeEBS:
         return {}
 
 
+def linear_checksum(blocks):
+    """
+    The aggregated checksum of the given written blocks, a mapping of
+    block index to data
+    """
+    digests = b''.join(
+        hashlib.sha256(blocks[index]).digest() for index in sorted(blocks)
+    )
+    return base64.b64encode(hashlib.sha256(digests).digest()).decode()
+
+
 def data_block(index, position=0):
     return ImageBlock(
         index, index.to_bytes(4, 'big') * (BLOCK_SIZE // 4), position
@@ -57,27 +69,54 @@ def test_write_skips_zero_blocks():
         data_block(3, 30),
     ]
     progress = []
-    written = write_snapshot_blocks(
+    data = write_snapshot_blocks(
         ebs, SNAPSHOT_ID, blocks, threads=2, progress=progress.append
     )
-    assert written == 2
+    assert data.blocks == 2
     assert ebs.blocks == {1: blocks[0].data, 3: blocks[2].data}
+    # The zero block is not part of the aggregated checksum
+    assert data.checksum == linear_checksum(ebs.blocks)
     assert progress == [10, 20, 30]
 
 
 def test_write_all_zero():
     ebs = FakeEBS()
     blocks = [ImageBlock(index, bytes(BLOCK_SIZE), 0) for index in range(3)]
-    assert write_snapshot_blocks(ebs, SNAPSHOT_ID, blocks) == 0
+    data = write_snapshot_blocks(ebs, SNAPSHOT_ID, blocks)
+    assert data.blocks == 0
+    assert data.checksum == linear_checksum({})
     assert ebs.blocks == {}
 
 
 def test_write_parallel():
     ebs = FakeEBS()
     blocks = [data_block(index) for index in range(1, 201)]
-    written = write_snapshot_blocks(ebs, SNAPSHOT_ID, iter(blocks), threads=8)
-    assert written == 200
+    data = write_snapshot_blocks(ebs, SNAPSHOT_ID, iter(blocks), threads=8)
+    assert data.blocks == 200
     assert ebs.blocks == {block.index: block.data for block in blocks}
+    # The blocks are written in any order, the aggregated checksum
+    # follows the order of the block index
+    assert data.checksum == linear_checksum(ebs.blocks)
+
+
+def test_checksum_differs_for_changed_order():
+    first = data_block(1)
+    second = data_block(2)
+    swapped = [
+        ImageBlock(1, second.data, 0), ImageBlock(2, first.data, 0)
+    ]
+    assert write_snapshot_blocks(
+        FakeEBS(), SNAPSHOT_ID, [first, second]
+    ).checksum != write_snapshot_blocks(
+        FakeEBS(), SNAPSHOT_ID, swapped
+    ).checksum
+
+
+@pytest.mark.parametrize('indexes', [[2, 1], [1, 1]])
+def test_write_requires_ascending_blocks(indexes):
+    blocks = [data_block(index) for index in indexes]
+    with pytest.raises(EC2PushError, match='ascending order'):
+        write_snapshot_blocks(FakeEBS(), SNAPSHOT_ID, blocks)
 
 
 def test_write_failure_stops_reading():

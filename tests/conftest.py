@@ -1,4 +1,7 @@
+import hashlib
+import lzma
 import os
+import re
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -18,6 +21,8 @@ class FakeRemoteHost:
     """
     instances: List['FakeRemoteHost'] = []
     fail_on: Optional[str] = None
+    # Simulates a target volume whose data differs from the image
+    corrupt_volume = False
 
     def __init__(self, hostname, user, pkey, timeout=300) -> None:
         self.hostname = hostname
@@ -36,7 +41,29 @@ class FakeRemoteHost:
         self.commands.append(command)
         if self.fail_on and self.fail_on in command:
             raise uploader.EC2PushError(f'{command} failed')
+        if command.endswith('| sha256sum'):
+            return self.volume_checksum(command)
         return ''
+
+    def volume_checksum(self, command: str) -> str:
+        """
+        Output of sha256sum for the target volume: the volume holds
+        the raw data of the uploaded image file
+        """
+        size = int(re.search(r'head -c (\d+) ', command).group(1))
+        source = self.uploads[-1][0]
+        opener = lzma.open if source.suffix == '.xz' else open
+        checksum = hashlib.sha256()
+        with opener(source, 'rb') as raw:
+            while size > 0:
+                data = raw.read(min(size, 1024 ** 2))
+                if not data:
+                    break
+                checksum.update(data)
+                size -= len(data)
+        if self.corrupt_volume:
+            checksum.update(b'corrupt')
+        return f'{checksum.hexdigest()}  -'
 
     def upload(
         self, source: Path, target: str,
@@ -76,6 +103,7 @@ def aws():
 def remote(monkeypatch):
     FakeRemoteHost.instances = []
     FakeRemoteHost.fail_on = None
+    FakeRemoteHost.corrupt_volume = False
     monkeypatch.setattr(uploader, 'RemoteHost', FakeRemoteHost)
     monkeypatch.setattr(uploader.time, 'sleep', lambda seconds: None)
     fast: Dict[str, int] = {'Delay': 1, 'MaxAttempts': 3}

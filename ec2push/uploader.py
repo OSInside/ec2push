@@ -6,7 +6,8 @@ with the EBS direct APIs, it needs no EC2 instance:
 
 1. Start a snapshot of the size of the root volume
 2. Write the blocks of the image holding data into the snapshot
-3. Complete the snapshot
+3. Complete the snapshot, EBS verifies the aggregated checksum of
+   the written blocks
 4. Register an AMI from the snapshot
 
 The helper method follows the procedure of ec2uploadimg from
@@ -18,9 +19,13 @@ ec2imgutils:
 2. Wait for ssh access to the helper instance
 3. Create an ext4 filesystem on the storage volume and mount it
 4. Upload the image file to the storage volume
-5. Dump the raw disk image to the target volume
+5. Dump the raw disk image to the target volume and verify the
+   checksum of the data read back from it against the checksum of
+   the local raw disk image
 6. Detach the target volume and create a snapshot from it
 7. Register an AMI from the snapshot
+
+The checksum verification of both methods can be switched off.
 
 All temporary resources (snapshot, helper instance, volumes,
 security group and key pair) are removed when the procedure ends,
@@ -31,10 +36,12 @@ import logging
 import math
 import secrets
 import shlex
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import boto3
 import paramiko
@@ -104,6 +111,7 @@ class UploadConfig:
     image_name: str
     method: str = METHOD_DIRECT
     upload_threads: int = ebsdirect.DEFAULT_THREADS
+    verify: bool = True
     description: Optional[str] = None
     arch: str = 'x86_64'
     boot_mode: Optional[str] = None
@@ -213,23 +221,37 @@ class EC2Push:
         def progress(position: int) -> None:
             if self.upload_progress:
                 self.upload_progress(position, image.upload_size)
-        blocks = ebsdirect.write_snapshot_blocks(
+        data = ebsdirect.write_snapshot_blocks(
             self.ebs, snapshot_id,
             image.read_blocks(ebsdirect.BLOCK_SIZE, volume_size * GiB),
             self.config.upload_threads, progress
         )
         progress(image.upload_size)
         log.info(
-            f'Wrote {blocks} blocks of '
-            f'{blocks * ebsdirect.BLOCK_SIZE / GiB:.2f}GiB data'
+            f'Wrote {data.blocks} blocks of '
+            f'{data.blocks * ebsdirect.BLOCK_SIZE / GiB:.2f}GiB data'
         )
-        self.ebs.complete_snapshot(
-            SnapshotId=snapshot_id, ChangedBlocksCount=blocks
-        )
-        log.info(f'Completing snapshot {snapshot_id}, waiting for it')
-        self._wait(
-            'snapshot_completed', WAIT_SNAPSHOT, SnapshotIds=[snapshot_id]
-        )
+        arguments: Dict[str, Any] = {
+            'SnapshotId': snapshot_id,
+            'ChangedBlocksCount': data.blocks,
+        }
+        # Without a written block there is nothing to verify
+        if self.config.verify and data.blocks:
+            arguments.update(
+                Checksum=data.checksum,
+                ChecksumAlgorithm=ebsdirect.CHECKSUM_ALGORITHM,
+                ChecksumAggregationMethod=(
+                    ebsdirect.CHECKSUM_AGGREGATION_METHOD
+                )
+            )
+            log.info(
+                f'Completing snapshot {snapshot_id} with checksum '
+                f'{data.checksum}, waiting for EBS to verify it'
+            )
+        else:
+            log.info(f'Completing snapshot {snapshot_id}, waiting for it')
+        self.ebs.complete_snapshot(**arguments)
+        self._wait_snapshot_completed(snapshot_id)
         return snapshot_id
 
     def _dump_with_helper(self, image: ImageFile, volume_size: int) -> str:
@@ -239,6 +261,17 @@ class EC2Push:
 
         Returns the id of the completed snapshot
         """
+        checksum = BackgroundChecksum(image) if self.config.verify else None
+        try:
+            return self._dump_and_snapshot(image, volume_size, checksum)
+        finally:
+            if checksum:
+                checksum.stop()
+
+    def _dump_and_snapshot(
+        self, image: ImageFile, volume_size: int,
+        checksum: Optional['BackgroundChecksum']
+    ) -> str:
         helper_ami = self._resolve_helper_ami()
         self.subnet_id = self._resolve_subnet()
         self._setup_key_pair()
@@ -262,6 +295,8 @@ class EC2Push:
         self._create_storage_filesystem(storage_device)
         remote_image = self._upload_image(image)
         self._dump_image(image, remote_image, target_device)
+        if checksum:
+            self._verify_volume(target_device, checksum.result())
         self._disconnect_helper_instance()
         self._detach_volume(target_volume)
         # The helper instance is no longer needed, start its
@@ -600,6 +635,29 @@ class EC2Push:
         remote.run(command)
         remote.run(f'umount {MOUNT_POINT}')
 
+    def _verify_volume(self, device: str, expected: Tuple[str, int]) -> None:
+        """
+        Compare the checksum of the data on the target volume with the
+        expected checksum of the raw disk image
+
+        The page cache is dropped first, the data is read back from
+        the volume and not from the cache filled by the dump.
+        """
+        digest, size = expected
+        log.info(f'Verifying the checksum of {size} bytes on {device}')
+        output = self._remote().run(
+            'sync && echo 3 > /proc/sys/vm/drop_caches && '
+            f'head -c {size} {device} | sha256sum'
+        )
+        volume_digest = output.split()[0] if output else ''
+        if volume_digest != digest:
+            raise EC2PushError(
+                f'Checksum verification of the target volume failed: '
+                f'the volume holds {volume_digest or "no data"}, '
+                f'the image {digest}'
+            )
+        log.info(f'Checksum {digest} of the target volume matches the image')
+
     def _terminate_helper_instance(self) -> None:
         if self.instance and not self.instance_terminating:
             self.ec2.terminate_instances(InstanceIds=[self._instance_id()])
@@ -614,10 +672,28 @@ class EC2Push:
         )['SnapshotId']
         self.temporary_snapshot = snapshot_id
         log.info(f'Creating snapshot {snapshot_id}, waiting for it')
-        self._wait(
-            'snapshot_completed', WAIT_SNAPSHOT, SnapshotIds=[snapshot_id]
-        )
+        self._wait_snapshot_completed(snapshot_id)
         return snapshot_id
+
+    def _wait_snapshot_completed(self, snapshot_id: str) -> None:
+        """
+        Wait for the snapshot to complete, report the reason if the
+        snapshot failed, e.g because EBS rejected its checksum
+        """
+        try:
+            self._wait(
+                'snapshot_completed', WAIT_SNAPSHOT, SnapshotIds=[snapshot_id]
+            )
+        except EC2PushAWSError:
+            snapshot = self.ec2.describe_snapshots(
+                SnapshotIds=[snapshot_id]
+            )['Snapshots'][0]
+            if snapshot['State'] != 'error':
+                raise
+            raise EC2PushAWSError(
+                f'Snapshot {snapshot_id} failed: '
+                f'{snapshot.get("StateMessage") or "no reason given"}'
+            )
 
     def _register_image(self, snapshot_id: str, volume_size: int) -> str:
         config = self.config
@@ -757,6 +833,33 @@ class EC2Push:
         if not self.remote:
             raise EC2PushError('Not connected to the helper instance')
         return self.remote
+
+
+class BackgroundChecksum:
+    """
+    Compute the checksum of the raw disk image in a background thread
+    while the helper instance gets set up and the image gets uploaded
+    """
+    def __init__(self, image: ImageFile) -> None:
+        self.cancel = threading.Event()
+        self.executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix='ec2push-checksum'
+        )
+        self.future = self.executor.submit(image.raw_checksum, self.cancel)
+
+    def result(self) -> Tuple[str, int]:
+        """
+        Wait for and return the hex digest and the size of the raw
+        disk image
+        """
+        return self.future.result()
+
+    def stop(self) -> None:
+        """
+        Stop the computation if it still runs
+        """
+        self.cancel.set()
+        self.executor.shutdown(wait=True)
 
 
 def load_private_key(path: Path) -> paramiko.PKey:

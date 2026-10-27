@@ -1,9 +1,12 @@
+import hashlib
 import lzma
 import os
 import shutil
+import threading
 
 import pytest
 
+import ec2push.image as image_module
 from ec2push.exceptions import EC2PushImageError
 from ec2push.image import read_image_file
 
@@ -161,3 +164,42 @@ def test_read_blocks_xz_truncated(tmp_path):
     path.write_bytes(path.read_bytes()[:32 * 1024])
     with pytest.raises(EC2PushImageError, match='Unable to decompress'):
         list(read_image_file(path).read_blocks(BLOCK, 1024 ** 2))
+
+
+def test_raw_checksum(tmp_path):
+    path = tmp_path / 'image.raw'
+    write_sparse_image(path)
+    content = path.read_bytes()
+    assert read_image_file(path).raw_checksum() == (
+        hashlib.sha256(content).hexdigest(), len(content)
+    )
+
+
+def test_raw_checksum_xz(tmp_path, monkeypatch):
+    raw = tmp_path / 'image.raw'
+    write_sparse_image(raw)
+    content = raw.read_bytes()
+    path = tmp_path / 'image.raw.xz'
+    with lzma.open(path, 'wb') as xz:
+        xz.write(content)
+    # Read in several chunks
+    monkeypatch.setattr(image_module, 'CHECKSUM_CHUNK_SIZE', BLOCK)
+    assert read_image_file(path).raw_checksum() == (
+        hashlib.sha256(content).hexdigest(), len(content)
+    )
+
+
+def test_raw_checksum_xz_corrupt(tmp_path):
+    path = tmp_path / 'image.raw.xz'
+    path.write_bytes(b'not really xz')
+    with pytest.raises(EC2PushImageError, match='Unable to decompress'):
+        read_image_file(path).raw_checksum()
+
+
+def test_raw_checksum_cancelled(tmp_path):
+    path = tmp_path / 'image.raw'
+    write_sparse_image(path)
+    cancel = threading.Event()
+    cancel.set()
+    with pytest.raises(EC2PushImageError, match='cancelled'):
+        read_image_file(path).raw_checksum(cancel)

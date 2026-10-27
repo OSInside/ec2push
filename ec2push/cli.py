@@ -16,6 +16,9 @@ ec2push IMAGE_FILE --name NAME [OPTIONS]
   region. The AWS credentials are taken from the given profile as
   configured in ~/.aws/config, without a profile the default
   credentials of boto3 are used.
+
+  The data written to EBS is verified against the checksum of the
+  raw disk image unless --no-verify is given.
 """
 import logging
 from enum import Enum
@@ -160,6 +163,10 @@ def main(
         DEFAULT_THREADS, '--upload-threads', min=1, max=64,
         help='Parallel block uploads of the direct method'
     ),
+    verify: bool = typer.Option(
+        True, '--verify/--no-verify',
+        help='Verify the checksum of the data written to EBS'
+    ),
     helper_ami: str = typer.Option(
         DEFAULT_HELPER_AMI, '--helper-ami',
         help='AMI id or SSM parameter name of the helper instance AMI',
@@ -241,6 +248,7 @@ def main(
         image_name=name,
         method=method.value,
         upload_threads=upload_threads,
+        verify=verify,
         description=description,
         arch=arch.value,
         boot_mode=boot_mode.value if boot_mode else None,

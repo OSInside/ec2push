@@ -16,8 +16,8 @@ no EC2 instance, volume, VPC or ssh access is needed:
 2. Read the image in blocks of 512 KiB and write all blocks which
    hold data in parallel (`PutSnapshotBlock`), xz compressed images
    are decompressed on the fly
-3. Complete the snapshot (`CompleteSnapshot`) and wait until it is
-   available
+3. Complete the snapshot (`CompleteSnapshot`) with the aggregated
+   checksum of all written blocks and wait until it is available
 4. Register an AMI from the snapshot
 
 Blocks which are never written read as zeros, therefore all-zero
@@ -45,8 +45,9 @@ KMS key, just like the volumes of the helper method.
 5. Upload the image file to the storage volume
 6. Dump the raw disk image to the target volume, xz compressed images
    are decompressed on the fly
-7. Detach the target volume and create a snapshot from it
-8. Register an AMI from the snapshot
+7. Verify the checksum of the data on the target volume
+8. Detach the target volume and create a snapshot from it
+9. Register an AMI from the snapshot
 
 The helper instance, the volumes and, unless given on the command line,
 a temporary key pair and security group are removed when ec2push ends,
@@ -55,6 +56,29 @@ also on failure or interruption. All temporary resources are tagged
 
 Use the helper method if the EBS direct APIs are not available to
 you, e.g. because they are not permitted by your IAM policies.
+
+### Checksum verification
+
+By default the data written to EBS is verified against the SHA256
+checksum of the raw disk image, `--no-verify` switches this off:
+
+* Direct method: in addition to the checksum of each block, the
+  aggregated checksum of all written blocks is passed to
+  `CompleteSnapshot`. EBS verifies the complete snapshot against it,
+  no data is read back. The aggregated checksum is the SHA256 of the
+  concatenated SHA256 digests of the written blocks in ascending
+  order of their block index (the `LINEAR` aggregation method). If
+  EBS rejects the checksum, the snapshot ends in the error state, it
+  is deleted and no AMI is registered. An image consisting of zeros
+  only writes no block, there is nothing to verify.
+* Helper method: the checksum of the raw disk image is computed
+  locally, xz compressed images are decompressed for it. This runs in
+  the background while the helper instance starts and the image is
+  uploaded. After the dump, the page cache of the helper instance is
+  dropped and the data is read back from the target volume to compute
+  its checksum with `sha256sum`. On a mismatch the upload fails before
+  a snapshot is created. Reading the data back takes about as long as
+  the dump itself.
 
 ## AWS permissions
 
@@ -93,8 +117,8 @@ independent of the architecture of the uploaded image.
 
 Use `--helper-ami` to launch a different AMI, either by AMI id or by
 SSM parameter name, and `--ssh-user` for its login user. The helper
-AMI needs `bash`, `sudo`, `lsblk`, `mkfs.ext4`, `dd` and, for xz
-compressed images, `xz`.
+AMI needs `bash`, `sudo`, `lsblk`, `mkfs.ext4`, `dd`, `head`,
+`sha256sum` and, for xz compressed images, `xz`.
 
 ## Installation
 

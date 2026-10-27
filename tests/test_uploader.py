@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import lzma
+import threading
 
 import pytest
 from botocore.exceptions import ClientError
@@ -16,6 +17,14 @@ from ec2push.uploader import (
 
 
 def helper_config(**arguments):
+    """
+    Configuration of the helper method
+
+    The checksum verification is off unless requested: the tests of
+    the helper method mostly use the 3GiB raw_image, verifying it
+    means reading it twice which takes a while.
+    """
+    arguments.setdefault('verify', False)
     return UploadConfig(method=METHOD_HELPER, **arguments)
 
 
@@ -152,7 +161,9 @@ def test_push_cleanup_on_failure(aws, remote, raw_image):
 
 @pytest.mark.parametrize('method', UPLOAD_METHODS)
 def test_push_existing_image_name(aws, remote, raw_image, method):
-    config = UploadConfig(image_name='test-image', method=method)
+    config = UploadConfig(
+        image_name='test-image', method=method, verify=False
+    )
     EC2Push(aws, config).push(read_image_file(raw_image))
     remote.instances = []
     with pytest.raises(EC2PushError, match='already exists'):
@@ -434,7 +445,9 @@ def test_load_private_key_invalid(tmp_path):
 def test_snapshot_removed_if_registration_fails(
     aws, remote, raw_image, method
 ):
-    config = UploadConfig(image_name='test-image', method=method)
+    config = UploadConfig(
+        image_name='test-image', method=method, verify=False
+    )
     pusher = EC2Push(aws, config)
 
     def register_fails(**arguments):
@@ -451,7 +464,9 @@ def test_snapshot_removed_if_registration_fails(
 
 @pytest.mark.parametrize('method', UPLOAD_METHODS)
 def test_image_not_available(aws, remote, raw_image, monkeypatch, method):
-    config = UploadConfig(image_name='test-image', method=method)
+    config = UploadConfig(
+        image_name='test-image', method=method, verify=False
+    )
     pusher = EC2Push(aws, config)
     wait = pusher._wait
 
@@ -506,6 +521,17 @@ def write_sample_image(path):
     }
 
 
+def linear_checksum(blocks):
+    """
+    The aggregated checksum CompleteSnapshot expects for the given
+    written blocks, a mapping of block index to data
+    """
+    digests = b''.join(
+        hashlib.sha256(blocks[index]).digest() for index in sorted(blocks)
+    )
+    return base64.b64encode(hashlib.sha256(digests).digest()).decode()
+
+
 def spy_complete_snapshot(pusher):
     calls = []
     complete_snapshot = pusher.ebs.complete_snapshot
@@ -544,10 +570,16 @@ def test_push_direct(aws, remote, tmp_path):
     assert {'Key': 'project', 'Value': 'demo'} in snapshot['Tags']
     assert {'Key': 'Name', 'Value': 'test-image'} in snapshot['Tags']
     # Zero blocks and holes are not written
-    assert snapshot_blocks(aws, snapshot_id) == expected_blocks
-    assert complete_calls == [
-        {'SnapshotId': snapshot_id, 'ChangedBlocksCount': 2}
-    ]
+    stored_blocks = snapshot_blocks(aws, snapshot_id)
+    assert stored_blocks == expected_blocks
+    # EBS verifies the snapshot against the aggregated checksum
+    assert complete_calls == [{
+        'SnapshotId': snapshot_id,
+        'ChangedBlocksCount': 2,
+        'Checksum': linear_checksum(stored_blocks),
+        'ChecksumAlgorithm': 'SHA256',
+        'ChecksumAggregationMethod': 'LINEAR',
+    }]
     size = path.stat().st_size
     assert progress[-1] == (size, size)
     assert progress == sorted(progress)
@@ -628,3 +660,155 @@ def test_push_direct_image_larger_than_volume(
 def test_invalid_config(aws, arguments, message):
     with pytest.raises(EC2PushError, match=message):
         EC2Push(aws, UploadConfig(image_name='x', **arguments))
+
+
+def verify_command(size):
+    return (
+        'sync && echo 3 > /proc/sys/vm/drop_caches && '
+        f'head -c {size} /dev/xvdg | sha256sum'
+    )
+
+
+def test_push_helper_verify(aws, remote, tmp_path):
+    path = tmp_path / 'image.raw'
+    write_sample_image(path)
+    config = helper_config(image_name='test-image', verify=True)
+    assert EC2Push(aws, config).push(read_image_file(path))
+    commands = remote.instances[0].commands
+    # The volume is verified after the dump and the umount
+    assert commands[-3].startswith('dd of=/dev/xvdg ')
+    assert commands[-2] == f'umount {MOUNT_POINT}'
+    assert commands[-1] == verify_command(path.stat().st_size)
+    assert leftovers(aws) == []
+
+
+def test_push_helper_verify_xz_image(aws, remote, tmp_path):
+    raw = tmp_path / 'image.raw'
+    write_sample_image(raw)
+    path = tmp_path / 'image.raw.xz'
+    with lzma.open(path, 'wb') as xz:
+        xz.write(raw.read_bytes())
+    image = read_image_file(path)
+    # The size to verify comes from the local checksum computation
+    image.raw_size = None
+    config = helper_config(
+        image_name='test-image', verify=True, root_volume_size=1
+    )
+    assert EC2Push(aws, config).push(image)
+    assert remote.instances[0].commands[-1] == verify_command(
+        raw.stat().st_size
+    )
+
+
+def test_push_helper_verify_mismatch(aws, remote, tmp_path):
+    path = tmp_path / 'image.raw'
+    write_sample_image(path)
+    remote.corrupt_volume = True
+    config = helper_config(image_name='test-image', verify=True)
+    with pytest.raises(EC2PushError, match='Checksum verification of the'):
+        EC2Push(aws, config).push(read_image_file(path))
+    # No snapshot got created from the volume and nothing is left
+    assert image_snapshots(aws) == []
+    assert aws.client('ec2').describe_images(Owners=['self'])['Images'] == []
+    assert leftovers(aws) == []
+
+
+def test_push_helper_verify_stopped_on_failure(aws, remote, tmp_path):
+    path = tmp_path / 'image.raw'
+    write_sample_image(path)
+    remote.fail_on = 'dd '
+    stopped = []
+    stop = uploader.BackgroundChecksum.stop
+
+    def record_stop(self):
+        stop(self)
+        stopped.append(self.cancel.is_set())
+    config = helper_config(image_name='test-image', verify=True)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(uploader.BackgroundChecksum, 'stop', record_stop)
+        with pytest.raises(EC2PushError, match='dd .* failed'):
+            EC2Push(aws, config).push(read_image_file(path))
+    assert stopped == [True]
+    assert not any(
+        thread.name.startswith('ec2push-checksum')
+        for thread in threading.enumerate()
+    )
+
+
+def test_background_checksum(tmp_path):
+    path = tmp_path / 'image.raw'
+    path.write_bytes(b'data')
+    checksum = uploader.BackgroundChecksum(read_image_file(path))
+    assert checksum.result() == (hashlib.sha256(b'data').hexdigest(), 4)
+    checksum.stop()
+
+
+def test_push_direct_no_verify(aws, remote, tmp_path):
+    path = tmp_path / 'image.raw'
+    write_sample_image(path)
+    pusher = EC2Push(aws, UploadConfig(image_name='test-image', verify=False))
+    complete_calls = spy_complete_snapshot(pusher)
+    pusher.push(read_image_file(path))
+    assert complete_calls == [{
+        'SnapshotId': complete_calls[0]['SnapshotId'],
+        'ChangedBlocksCount': 2,
+    }]
+
+
+def test_push_direct_zero_image(aws, remote, tmp_path):
+    path = tmp_path / 'image.raw'
+    path.write_bytes(bytes(3 * BLOCK_SIZE))
+    pusher = EC2Push(aws, UploadConfig(image_name='test-image'))
+    complete_calls = spy_complete_snapshot(pusher)
+    pusher.push(read_image_file(path))
+    # Without a written block there is no checksum to verify
+    assert complete_calls == [{
+        'SnapshotId': complete_calls[0]['SnapshotId'],
+        'ChangedBlocksCount': 0,
+    }]
+
+
+def snapshot_in_state(pusher, monkeypatch, state, message):
+    """
+    Let the snapshot waiter fail and describe the snapshot in the
+    given state
+    """
+    wait = pusher._wait
+    describe_snapshots = pusher.ec2.describe_snapshots
+
+    def snapshot_not_completed(name, config=None, **arguments):
+        if name == 'snapshot_completed':
+            raise EC2PushAWSError('Waiting for snapshot_completed failed')
+        return wait(name, config, **arguments)
+
+    def describe_in_state(**arguments):
+        response = describe_snapshots(**arguments)
+        for snapshot in response['Snapshots']:
+            snapshot['State'] = state
+            snapshot['StateMessage'] = message
+        return response
+    monkeypatch.setattr(pusher, '_wait', snapshot_not_completed)
+    monkeypatch.setattr(pusher.ec2, 'describe_snapshots', describe_in_state)
+
+
+def test_push_direct_snapshot_error(aws, remote, tmp_path, monkeypatch):
+    path = tmp_path / 'image.raw'
+    write_sample_image(path)
+    pusher = EC2Push(aws, UploadConfig(image_name='test-image'))
+    snapshot_in_state(pusher, monkeypatch, 'error', 'Checksum mismatch')
+    with pytest.raises(
+        EC2PushAWSError, match='Snapshot snap-.* failed: Checksum mismatch'
+    ):
+        pusher.push(read_image_file(path))
+    # The failed snapshot is removed
+    assert pusher.temporary_snapshot is None
+    assert image_snapshots(aws) == []
+
+
+def test_push_direct_snapshot_timeout(aws, remote, tmp_path, monkeypatch):
+    path = tmp_path / 'image.raw'
+    write_sample_image(path)
+    pusher = EC2Push(aws, UploadConfig(image_name='test-image'))
+    snapshot_in_state(pusher, monkeypatch, 'pending', '')
+    with pytest.raises(EC2PushAWSError, match='snapshot_completed failed'):
+        pusher.push(read_image_file(path))
