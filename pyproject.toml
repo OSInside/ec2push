@@ -1,11 +1,14 @@
 [tool.poetry]
 name = "ec2push"
-version = "0.1.0"
+version = "1.0.1"
 description = "Upload a raw disk image to AWS EC2 and register it as AMI"
 license = "GPL-3.0-or-later"
 readme = "README.md"
 authors = []
 packages = [{ include = "ec2push" }]
+include = [
+   { path = ".bumpversion.cfg", format = "sdist" },
+]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
@@ -26,6 +29,7 @@ typer = ">=0.12.0"
 ec2push = "ec2push.cli:app"
 
 [tool.poetry.group.dev.dependencies]
+bumpversion = "*"
 flake8 = ">=7.0.0"
 moto = { version = ">=5.0.0", extras = ["ec2", "ssm"] }
 pytest = ">=8.0.0"
