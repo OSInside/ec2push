@@ -122,11 +122,11 @@ AMI needs `bash`, `sudo`, `lsblk`, `mkfs.ext4`, `dd`, `head`,
 
 ## Installation
 
-    poetry install
+    pip3 install ec2push
 
 ## Usage From Source
 
-    poetry run ec2push IMAGE_FILE --name NAME [OPTIONS]
+    poetry install
 
 For example:
 
