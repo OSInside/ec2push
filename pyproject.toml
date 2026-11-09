@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "ec2push"
-version = "1.0.1"
+version = "1.0.2"
 description = "Upload a raw disk image to AWS EC2 and register it as AMI"
 license = "GPL-3.0-or-later"
 readme = "README.md"

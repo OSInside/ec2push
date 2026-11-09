@@ -7,7 +7,7 @@
         <specification>ec2push</specification>
     </description>
     <preferences>
-        <version>1.0.1</version>
+        <version>1.0.2</version>
         <packagemanager>zypper</packagemanager>
         <rpm-excludedocs>true</rpm-excludedocs>
         <rpm-check-signatures>false</rpm-check-signatures>
